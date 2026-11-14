@@ -584,7 +584,7 @@ body.in-chat .toast{bottom:auto;top:84px}
   <section data-tab="samarbete" class="hidden">
     <div class="card">
       <h2>🔗 Samarbete mellan företag</h2>
-      <p class="hint" style="margin-top:0"><strong>Testversion:</strong> samarbetsprojekt och chatt fungerar inom ert företag (alla med samma företagskod). Koppling mellan olika företag kommer vid lansering.<br>Huvudentreprenören skapar ett projekt och delar en kod. Underentreprenörer ansluter och skickar dagbok, ÄTA och egenkontroller direkt – HE godkänner och får en samlad bild.</p>
+      <p class="hint" style="margin-top:0">Huvudentreprenören skapar ett projekt och delar en kod. Underentreprenörer ansluter och skickar dagbok, ÄTA och egenkontroller direkt – HE godkänner och får en samlad bild.</p>
       <div class="chips" style="margin-top:12px" id="hRoleChips">
         <button class="chip" data-roll="ue">🔨 Jag är UE / hantverkare</button>
         <button class="chip" data-roll="he">🏗️ Jag är huvudentreprenör</button>
@@ -755,15 +755,19 @@ const PROFILE = 'data/shared/profile';
 const clone = o => o == null ? o : JSON.parse(JSON.stringify(o));
 const autoId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
 function bump(p) { VER.set(p, ++ver); }
-(function loadCache() { const c = jget(CACHE_KEY, null); if (c && c.docs) { Object.entries(c.docs).forEach(([p, d]) => { M.set(p, d); bump(p); }); Object.entries(c.ts || {}).forEach(([p, t]) => TS.set(p, t)); lastTs = c.last || null; } Object.entries(outbox).forEach(([p, o]) => { if (o.op === 'set') M.set(p, o.data); else M.delete(p); bump(p); }); })();
+const hubOf = p => { const m = /^hub\/([A-Z0-9]{6,20})(\/|$)/.exec(p); return m ? m[1] : null; };
+const HUBS = new Map(); const hubLoaded = new Set();
+const cacheOf = p => { const h = hubOf(p); return !loaded || (h && !hubLoaded.has(h)); };
+function track(h) { if (!h || HUBS.has(h)) return false; HUBS.set(h, null); return true; }
+(function loadCache() { const c = jget(CACHE_KEY, null); if (c && c.docs) { Object.entries(c.docs).forEach(([p, d]) => { M.set(p, d); bump(p); }); Object.entries(c.ts || {}).forEach(([p, t]) => TS.set(p, t)); lastTs = c.last || null; Object.entries(c.hubs || {}).forEach(([h, t]) => HUBS.set(h, t)); } Object.entries(outbox).forEach(([p, o]) => { if (o.op === 'set') M.set(p, o.data); else M.delete(p); bump(p); }); })();
 let cacheT = null;
-function saveCache() { clearTimeout(cacheT); cacheT = setTimeout(() => { if (!ls.set(CACHE_KEY, JSON.stringify({docs: Object.fromEntries(M), ts: Object.fromEntries(TS), last: lastTs}))) ls.del(CACHE_KEY); }, 800); }
+function saveCache() { clearTimeout(cacheT); cacheT = setTimeout(() => { if (!ls.set(CACHE_KEY, JSON.stringify({docs: Object.fromEntries(M), ts: Object.fromEntries(TS), last: lastTs, hubs: Object.fromEntries(HUBS)}))) ls.del(CACHE_KEY); }, 800); }
 function saveOutbox() { ls.set(OUT_KEY, JSON.stringify(outbox)); }
 
 function snapFor(q) {
   if (q.doc) {
     const d = q.doc === PROFILE ? jget(PROF_KEY, null) : M.get(q.doc);
-    return {sig: (VER.get(q.doc) || 0) + ':' + (d != null), snap: {id: q.doc.slice(q.doc.lastIndexOf('/') + 1), exists: d != null, data: () => clone(d), metadata: {fromCache: !loaded}}};
+    return {sig: (VER.get(q.doc) || 0) + ':' + (d != null), snap: {id: q.doc.slice(q.doc.lastIndexOf('/') + 1), exists: d != null, data: () => clone(d), metadata: {fromCache: cacheOf(q.doc)}}};
   }
   let docs = [];
   for (const [p, d] of M) if (parentOf(p) === q.path) docs.push([p, d]);
@@ -771,17 +775,19 @@ function snapFor(q) {
   if (q.order) { const [f, dir] = q.order; const s = dir === 'desc' ? -1 : 1; docs.sort((a, b) => { const x = (a[1] || {})[f] ?? '', y = (b[1] || {})[f] ?? ''; return (x < y ? -1 : x > y ? 1 : 0) * s; }); }
   if (q.lim) docs = docs.slice(0, q.lim);
   const sig = docs.map(([p]) => p + ':' + (VER.get(p) || 0)).join('|') + (q.path === 'data/shared' ? '#' + profVer : '');
-  return {sig, snap: {docs: docs.map(([p, d]) => ({id: p.slice(q.path.length + 1), exists: true, data: () => clone(d)})), metadata: {fromCache: !loaded}, size: docs.length, empty: !docs.length}};
+  return {sig, snap: {docs: docs.map(([p, d]) => ({id: p.slice(q.path.length + 1), exists: true, data: () => clone(d)})), metadata: {fromCache: cacheOf(q.path)}, size: docs.length, empty: !docs.length}};
 }
 let profVer = 0, notifyT = null;
 function notify() { if (notifyT) return; notifyT = setTimeout(() => { notifyT = null; listeners.forEach(fire); }, 0); }
-function fire(l) { const {sig, snap} = snapFor(l.q); if (sig === l.sig && l.loaded === loaded) return; l.sig = sig; l.loaded = loaded; try { l.cb(snap); } catch (e) { console.error(e); } }
+function fire(l) { const {sig, snap} = snapFor(l.q); const ld = !snap.metadata.fromCache; if (sig === l.sig && l.loaded === ld) return; l.sig = sig; l.loaded = ld; try { l.cb(snap); } catch (e) { console.error(e); } }
 
 let code = null;
 async function flush() {
   for (const [p, o] of Object.entries(outbox)) {
     try {
-      const ts = o.op === 'set' ? await rpc('upsert_item', {p_secret: code, p_id: p, p_kind: parentOf(p), p_data: o.data}) : await rpc('delete_item', {p_secret: code, p_id: p});
+      const h = hubOf(p);
+      const ts = h ? (o.op === 'set' ? await rpc('hub_upsert', {p_secret: code, p_hub: h, p_id: p, p_data: o.data}) : await rpc('hub_delete', {p_secret: code, p_hub: h, p_id: p}))
+        : o.op === 'set' ? await rpc('upsert_item', {p_secret: code, p_id: p, p_kind: parentOf(p), p_data: o.data}) : await rpc('delete_item', {p_secret: code, p_id: p});
       if (outbox[p] === o) { delete outbox[p]; saveOutbox(); }
       if (ts) TS.set(p, ts);
     } catch (e) {
@@ -807,14 +813,34 @@ async function pull() {
     if (rows.length < 1000) break;
     since = rows[rows.length - 1].updated_at;
   }
+  const res = await Promise.all([...HUBS.keys()].map(h => pullHub(h)));
+  if (res.some(Boolean)) changed = true;
   return changed;
 }
-let syncing = false;
+async function pullHub(h) {
+  let last = HUBS.get(h), since = last ? new Date(new Date(last).getTime() - 5000).toISOString() : null, changed = false;
+  for (let guard = 0; guard < 50; guard++) {
+    const rows = await rpc('hub_list', {p_secret: code, p_hub: h, p_since: since});
+    for (const r of rows) {
+      if (!last || r.updated_at > last) last = r.updated_at;
+      if (outbox[r.id] || TS.get(r.id) === r.updated_at) continue;
+      TS.set(r.id, r.updated_at);
+      if (r.deleted) { if (M.has(r.id)) { M.delete(r.id); bump(r.id); changed = true; } }
+      else { M.set(r.id, r.data); bump(r.id); changed = true; }
+    }
+    if (rows.length < 1000) break;
+    since = rows[rows.length - 1].updated_at;
+  }
+  HUBS.set(h, last || null);
+  if (!hubLoaded.has(h)) { hubLoaded.add(h); changed = true; }
+  return changed;
+}
+let syncing = false, again = false;
 async function sync() {
-  if (syncing) return; syncing = true;
+  if (syncing) { again = true; return; } syncing = true; again = false;
   try { await flush(); const ch = await pull(); setOnline(true); if (!loaded) { loaded = true; notify(); } if (ch) { notify(); saveCache(); } }
   catch (e) { setOnline(false); if (e.code === 'P0002') { alert('Företagskoden fungerar inte längre. Logga in igen.'); window.bsLogout(); } }
-  finally { syncing = false; }
+  finally { syncing = false; if (again) setTimeout(sync, 50); }
 }
 function start() {
   if (started) return; started = true;
@@ -839,11 +865,11 @@ function docRef(path) {
   return {
     id: path.slice(path.lastIndexOf('/') + 1), path,
     collection: sub => coll(path + '/' + sub),
-    async get() { await waitLoaded(); const d = path === PROFILE ? jget(PROF_KEY, null) : M.get(path); return {id: this.id, exists: d != null, data: () => clone(d)}; },
+    async get() { await waitLoaded(); const h = hubOf(path); if (h && !hubLoaded.has(h)) { track(h); try { await pullHub(h); notify(); } catch (e) {} } const d = path === PROFILE ? jget(PROF_KEY, null) : M.get(path); return {id: this.id, exists: d != null, data: () => clone(d)}; },
     set: data => write(path, clone(data)),
     async update(part) { const cur = path === PROFILE ? jget(PROF_KEY, {}) : M.get(path); if (!cur) { const e = new Error('not_found'); e.code = 'not_found'; throw e; } return write(path, Object.assign(clone(cur), clone(part))); },
     delete: () => del(path),
-    onSnapshot(cb) { const l = {q: {doc: path}, cb, sig: null}; listeners.add(l); start(); setTimeout(() => fire(l), 0); return () => listeners.delete(l); }
+    onSnapshot(cb) { if (track(hubOf(path))) sync(); const l = {q: {doc: path}, cb, sig: null}; listeners.add(l); start(); setTimeout(() => fire(l), 0); return () => listeners.delete(l); }
   };
 }
 function coll(path, q) {
@@ -854,7 +880,7 @@ function coll(path, q) {
     async add(data) { const r = docRef(path + '/' + autoId()); await r.set(data); return r; },
     orderBy: (f, dir) => coll(path, Object.assign({}, q, {order: [f, dir || 'asc']})),
     limit: n => coll(path, Object.assign({}, q, {lim: n})),
-    onSnapshot(cb) { const l = {q, cb, sig: null}; listeners.add(l); start(); setTimeout(() => fire(l), 0); return () => listeners.delete(l); }
+    onSnapshot(cb) { if (track(hubOf(path))) sync(); const l = {q, cb, sig: null}; listeners.add(l); start(); setTimeout(() => fire(l), 0); return () => listeners.delete(l); }
   };
 }
 const db = {collection: p => coll(p), doc: p => docRef(p)};
@@ -2268,7 +2294,7 @@ function ensureSubs() {
 }
 let hubT, hubAll = false;
 function renderHubSoon(all) { hubAll = hubAll || all; clearTimeout(hubT); hubT = setTimeout(() => { renderHub(); if (hubAll) { renderAta(); renderChecks(); renderDiaryList(); } renderBh(); hubAll = false; }, 40); }
-const genCode = () => Array.from({length: 6}, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]).join('');
+const genCode = () => Array.from({length: 8}, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]).join('');
 const hubPost = (code, id) => (hubData.get(code) || {posts: new Map()}).posts.get(id);
 const BESLUT = {vantar: ['Väntar på HE', ''], godkand: ['HE: Godkänd', 'ok'], avslagen: ['HE: Avslagen', 'grey']};
 
@@ -2448,7 +2474,7 @@ $('uJoin').onclick = async () => {
     else { pid = uid('p'); put(pid, {kind: 'project', namn: hub.namn, adress: hub.adress || '', bestallare: (hub.he || 'Huvudentreprenör') + ' (HE)', avtal: 'AB 04 (utförandeentreprenad)', hub: code, skapad: today()}); }
     localStorageSet('lastProj', pid); $('uCode').value = '';
     toast('Ansluten till ' + hub.namn + (f.foretag ? '' : ' – fyll i företagsnamn under ⚙️'));
-  } catch (err) { showErr('uErr', 'Kunde inte ansluta. Du behöver skrivbehörighet – be huvudentreprenören bjuda in dig till sidan.'); }
+  } catch (err) { showErr('uErr', 'Kunde inte ansluta. Kontrollera koden och internetanslutningen.'); }
   btn.disabled = false;
 };
 
